@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "NotebookLM Sort by Creation Date",
-  "version": "1.0.0",
-  "description": "NotebookLMのノートブック一覧に「作成日順」ソート機能を追加します",
+  "name": "NotebookLM Toolkit",
+  "version": "2.0.0",
+  "description": "NotebookLMのノートブック一覧に作成日順ソート・タイトル検索機能を追加します",
   "content_scripts": [
     {
       "matches": ["https://notebooklm.google.com/*"],

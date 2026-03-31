@@ -1,4 +1,4 @@
-// NotebookLM Sort by Creation Date - Content Script
+// NotebookLM Toolkit - Content Script
 // DOM変更への耐性を最優先し、CSSクラス名に依存しない設計
 
 (function () {
@@ -8,13 +8,14 @@
     DATE_PATTERN: /(\d{4})\/(\d{2})\/(\d{2})/,
     NOTEBOOK_URL_PATTERN: /\/notebook\/[a-f0-9-]+/,
     SORT_BUTTON_TEXTS: ["新しい順", "古い順", "Newest", "Oldest"],
-    BUTTON_ID: "nlm-sort-by-creation",
+    SORT_BUTTON_ID: "nlm-toolkit-sort",
+    SEARCH_INPUT_ID: "nlm-toolkit-search",
     DEBOUNCE_MS: 500,
-    LOG: "[NLM-Sort]",
+    LOG: "[NLM-Toolkit]",
   };
 
   // ============================================================
-  // DOM探索
+  // DOM探索（ソート・検索共通基盤）
   // ============================================================
 
   /**
@@ -41,7 +42,6 @@
       const dateMatch = textNode.textContent.match(CONFIG.DATE_PATTERN);
       if (!dateMatch) continue;
 
-      // notebook URLリンクを含む祖先があるか確認
       let el = textNode.parentElement;
       let hasNotebookLink = false;
       while (el && el !== document.body) {
@@ -79,20 +79,15 @@
     while (current && current.parentElement !== ancestor) {
       current = current.parentElement;
     }
-    return current; // null if el is not a descendant of ancestor
+    return current;
   }
 
   /**
    * 全祖先スキャンで最適なコンテナを発見する
-   *
-   * 複数の起点から祖先チェインを辿り、各祖先候補に対して
-   * 「何個のユニークな直接子要素が日付要素を含むか」を数える。
-   * 最大数の祖先 = 正しいコンテナ（「最近のノートブック」のグリッド）
    */
   function findBestContainer(dateElements) {
     if (dateElements.length < 2) return null;
 
-    // 複数の起点から探索（おすすめ / 最近の両セクションをカバー）
     const startIndices = [
       0,
       Math.floor(dateElements.length / 2),
@@ -101,20 +96,16 @@
 
     let bestContainer = null;
     let bestCount = 0;
-
-    // 既にチェック済みの祖先を記録
     const checked = new Set();
 
     for (const idx of startIndices) {
       let el = dateElements[idx].dateElement;
 
-      // この起点の祖先チェインを body まで辿る
       while (el && el !== document.body) {
         el = el.parentElement;
         if (!el || checked.has(el)) continue;
         checked.add(el);
 
-        // この祖先候補に対して、ユニークな直接子要素を数える
         const childSet = new Set();
         for (const item of dateElements) {
           const child = findDirectChildOf(el, item.dateElement);
@@ -132,8 +123,26 @@
     return bestContainer;
   }
 
+  /**
+   * コンテナ内のソート可能な単位（直接子要素 + 日付）を構築
+   */
+  function buildSortUnits(dateElements, container) {
+    const unitMap = new Map();
+    for (const item of dateElements) {
+      const directChild = findDirectChildOf(container, item.dateElement);
+      if (!directChild) continue;
+      if (unitMap.has(directChild)) continue;
+      unitMap.set(directChild, {
+        sortableElement: directChild,
+        date: item.date,
+        dateStr: item.dateStr,
+      });
+    }
+    return Array.from(unitMap.values());
+  }
+
   // ============================================================
-  // ソートボタン
+  // ツールバー要素の発見
   // ============================================================
 
   function findSortButtonElement() {
@@ -158,11 +167,17 @@
     return null;
   }
 
+  // ============================================================
+  // ソート機能
+  // ============================================================
+
+  let isSorting = false;
+
   function injectSortButton(anchorElement) {
-    if (document.getElementById(CONFIG.BUTTON_ID)) return;
+    if (document.getElementById(CONFIG.SORT_BUTTON_ID)) return;
 
     const btn = document.createElement("button");
-    btn.id = CONFIG.BUTTON_ID;
+    btn.id = CONFIG.SORT_BUTTON_ID;
     btn.dataset.order = "desc";
 
     const computed = window.getComputedStyle(anchorElement);
@@ -181,21 +196,21 @@
       z-index: 1;
     `;
 
-    updateButtonLabel(btn);
+    updateSortButtonLabel(btn);
 
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
       btn.dataset.order = btn.dataset.order === "desc" ? "asc" : "desc";
       performSort(btn.dataset.order);
-      updateButtonLabel(btn);
+      updateSortButtonLabel(btn);
     });
 
     anchorElement.insertAdjacentElement("afterend", btn);
     console.log(CONFIG.LOG, "ソートボタンを注入しました");
   }
 
-  function updateButtonLabel(btn) {
+  function updateSortButtonLabel(btn) {
     const dateElements = discoverDateElements();
     const container = findBestContainer(dateElements);
     let count = 0;
@@ -209,12 +224,6 @@
     btn.textContent = `作成日順 ${arrow}${countStr}`;
   }
 
-  // ============================================================
-  // ソートロジック
-  // ============================================================
-
-  let isSorting = false;
-
   function performSort(order = "desc") {
     const dateElements = discoverDateElements();
     const container = findBestContainer(dateElements);
@@ -224,33 +233,14 @@
       return;
     }
 
-    // コンテナ内の日付要素から、ソート単位（直接子要素）を構築
-    const unitMap = new Map(); // directChild -> { element, date }
-    for (const item of dateElements) {
-      const directChild = findDirectChildOf(container, item.dateElement);
-      if (!directChild) continue;
-      // 同じ直接子要素に複数の日付がある場合、最初のものを使う
-      if (unitMap.has(directChild)) continue;
-      unitMap.set(directChild, {
-        sortableElement: directChild,
-        date: item.date,
-        dateStr: item.dateStr,
-      });
-    }
+    const units = buildSortUnits(dateElements, container);
+    if (units.length === 0) return;
 
-    const units = Array.from(unitMap.values());
-    if (units.length === 0) {
-      console.warn(CONFIG.LOG, "ソート単位が見つかりません");
-      return;
-    }
-
-    // ソート
     units.sort((a, b) => {
       const diff = a.date.getTime() - b.date.getTime();
       return order === "desc" ? -diff : diff;
     });
 
-    // DOM並び替え
     isSorting = true;
     for (const unit of units) {
       container.appendChild(unit.sortableElement);
@@ -264,37 +254,137 @@
   }
 
   // ============================================================
+  // 検索（タイトルフィルタ）機能
+  // ============================================================
+
+  /** 元の display 値を保存するための WeakMap */
+  const originalDisplay = new WeakMap();
+
+  function injectSearchInput(anchorElement) {
+    if (document.getElementById(CONFIG.SEARCH_INPUT_ID)) return;
+
+    const input = document.createElement("input");
+    input.id = CONFIG.SEARCH_INPUT_ID;
+    input.type = "text";
+    input.placeholder = "ノートブックを検索...";
+
+    const computed = window.getComputedStyle(anchorElement);
+    input.style.cssText = `
+      padding: ${computed.padding || "6px 16px"};
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: ${computed.borderRadius || "8px"};
+      background: transparent;
+      color: ${computed.color || "inherit"};
+      font-family: ${computed.fontFamily || "inherit"};
+      font-size: ${computed.fontSize || "14px"};
+      margin-left: 8px;
+      width: 200px;
+      outline: none;
+      position: relative;
+      z-index: 1;
+    `;
+
+    // フォーカス時のスタイル
+    input.addEventListener("focus", () => {
+      input.style.borderColor = "rgba(138,180,248,0.8)";
+    });
+    input.addEventListener("blur", () => {
+      input.style.borderColor = "rgba(255,255,255,0.2)";
+    });
+
+    // イベントが裏のUIに伝播しないようにする
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("keydown", (e) => e.stopPropagation());
+
+    // リアルタイムフィルタ
+    let filterTimer = null;
+    input.addEventListener("input", () => {
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => performFilter(input.value), 150);
+    });
+
+    // ソートボタンの後に挿入（あれば）、なければアンカーの後
+    const sortBtn = document.getElementById(CONFIG.SORT_BUTTON_ID);
+    const insertAfter = sortBtn || anchorElement;
+    insertAfter.insertAdjacentElement("afterend", input);
+
+    console.log(CONFIG.LOG, "検索フィールドを注入しました");
+  }
+
+  function performFilter(query) {
+    const dateElements = discoverDateElements();
+    const container = findBestContainer(dateElements);
+    if (!container) return;
+
+    const units = buildSortUnits(dateElements, container);
+    const normalizedQuery = query.trim().toLowerCase();
+
+    let visibleCount = 0;
+
+    for (const unit of units) {
+      const el = unit.sortableElement;
+
+      // 元の display 値を初回のみ保存
+      if (!originalDisplay.has(el)) {
+        originalDisplay.set(el, el.style.display);
+      }
+
+      if (normalizedQuery === "") {
+        // フィルタ解除
+        el.style.display = originalDisplay.get(el) || "";
+        visibleCount++;
+      } else {
+        // カード内のテキストで部分一致検索
+        const cardText = el.textContent.toLowerCase();
+        if (cardText.includes(normalizedQuery)) {
+          el.style.display = originalDisplay.get(el) || "";
+          visibleCount++;
+        } else {
+          el.style.display = "none";
+        }
+      }
+    }
+
+    console.log(
+      CONFIG.LOG,
+      `フィルタ "${query}": ${visibleCount}/${units.length}件表示`,
+    );
+  }
+
+  // ============================================================
   // 初期化・SPA対応
   // ============================================================
 
   let debounceTimer = null;
 
-  function tryInjectButton() {
-    if (document.getElementById(CONFIG.BUTTON_ID)) return;
+  function tryInjectUI() {
     const dateElements = discoverDateElements();
     if (dateElements.length === 0) return;
 
     const sortBtn = findSortButtonElement();
     if (!sortBtn) return;
 
+    // ソートボタン注入
     injectSortButton(sortBtn);
+    // 検索フィールド注入
+    injectSearchInput(sortBtn);
   }
 
   function initialize() {
     const observer = new MutationObserver(() => {
       if (isSorting) return;
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => tryInjectButton(), CONFIG.DEBOUNCE_MS);
+      debounceTimer = setTimeout(() => tryInjectUI(), CONFIG.DEBOUNCE_MS);
     });
     observer.observe(document.body, { childList: true, subtree: true });
-    tryInjectButton();
+    tryInjectUI();
 
     // SPA遷移検知
     let lastUrl = location.href;
     new MutationObserver(() => {
       if (location.href !== lastUrl) {
         lastUrl = location.href;
-        setTimeout(tryInjectButton, 1000);
+        setTimeout(tryInjectUI, 1000);
       }
     }).observe(document, { subtree: true, childList: true });
 

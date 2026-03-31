@@ -16,6 +16,9 @@ Desktop.ini
 node_modules/
 package-lock.json
 
+# Ideas (ローカルのみ)
+ideas/
+
 # Build artifacts
 *.zip
 *.crx
