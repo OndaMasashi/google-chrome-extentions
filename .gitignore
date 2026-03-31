@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Node (将来の拡張用)
+node_modules/
+package-lock.json
+
+# Build artifacts
+*.zip
+*.crx
+*.pem
