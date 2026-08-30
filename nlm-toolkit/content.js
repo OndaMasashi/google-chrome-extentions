@@ -1,33 +1,101 @@
-// NotebookLM Toolkit - Content Script
+// Gemini Notebook (旧 NotebookLM) Toolkit - Content Script
 // DOM変更への耐性を最優先し、CSSクラス名に依存しない設計
 
 (function () {
   "use strict";
 
   const CONFIG = {
-    DATE_PATTERN: /(\d{4})\/(\d{2})\/(\d{2})/,
-    NOTEBOOK_URL_PATTERN: /\/notebook\/[a-f0-9-]+/,
-    SORT_BUTTON_TEXTS: ["新しい順", "古い順", "Newest", "Oldest"],
+    // ノートブックカードを識別するためのリンク／属性
+    NOTEBOOK_LINK_SELECTOR:
+      'a[href*="/notebook/"], a[href*="/notebooks/"], [data-notebook-id]',
+    // 並び替えUIのラベル候補（この横にツールバーを差し込む）
+    SORT_LABELS: [
+      "新しい順",
+      "古い順",
+      "最近使用したもの",
+      "更新日順",
+      "名前順",
+      "Newest",
+      "Oldest",
+      "Recently viewed",
+      "Most recent",
+      "Title",
+    ],
     SORT_BUTTON_ID: "nlm-toolkit-sort",
     SEARCH_INPUT_ID: "nlm-toolkit-search",
+    PANEL_ID: "nlm-toolkit-panel",
     DEBOUNCE_MS: 500,
+    // アンカーが見つからない回数がこれを超えたら浮動パネルに切り替える
+    ANCHOR_RETRY_LIMIT: 6,
+    // 注入できるまでの定期リトライ（DOMの変化が止まっても取りこぼさないため）
+    RETRY_INTERVAL_MS: 800,
+    RETRY_MAX: 40,
     LOG: "[NLM-Toolkit]",
   };
+
+  // ============================================================
+  // 日付パース（ロケール差・表記ゆれを吸収）
+  // ============================================================
+
+  const MONTH_NAMES = {
+    jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+    jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+  };
+
+  function makeDate(y, m, d) {
+    y = Number(y);
+    m = Number(m);
+    d = Number(d);
+    if (!y || m < 1 || m > 12 || d < 1 || d > 31) return null;
+    const date = new Date(y, m - 1, d);
+    return isNaN(date.getTime()) ? null : date;
+  }
+
+  function monthFromName(name) {
+    return MONTH_NAMES[name.slice(0, 3).toLowerCase()];
+  }
+
+  const DATE_MATCHERS = [
+    // 2026/08/31, 2026-08-31
+    { re: /(\d{4})[/-](\d{1,2})[/-](\d{1,2})/, build: (m) => makeDate(m[1], m[2], m[3]) },
+    // 2026年8月31日
+    { re: /(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/, build: (m) => makeDate(m[1], m[2], m[3]) },
+    // Aug 31, 2026 / August 31, 2026
+    { re: /([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})/, build: (m) => makeDate(m[3], monthFromName(m[1]), m[2]) },
+    // 31 Aug 2026
+    { re: /(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})/, build: (m) => makeDate(m[3], monthFromName(m[2]), m[1]) },
+  ];
+
+  function parseDate(text) {
+    for (const matcher of DATE_MATCHERS) {
+      const m = text.match(matcher.re);
+      if (!m) continue;
+      const date = matcher.build(m);
+      if (date) return { date, dateStr: m[0] };
+    }
+    return null;
+  }
 
   // ============================================================
   // DOM探索（ソート・検索共通基盤）
   // ============================================================
 
   /**
-   * YYYY/MM/DD パターン + notebook URLリンクを含む要素を発見
+   * 日付テキスト + ノートブックリンクを含む要素を発見。
+   * ページ内にノートブックリンクが1つも無い場合（SPAがaタグを使わない構成）は
+   * リンク条件を外して日付テキストのみで探索する。
    */
   function discoverDateElements() {
+    const requireLink =
+      document.querySelector(CONFIG.NOTEBOOK_LINK_SELECTOR) !== null;
+
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
       {
         acceptNode(node) {
-          return CONFIG.DATE_PATTERN.test(node.textContent)
+          // 全ての対応フォーマットは4桁の西暦を含む
+          return /\d{4}/.test(node.textContent)
             ? NodeFilter.FILTER_ACCEPT
             : NodeFilter.FILTER_REJECT;
         },
@@ -39,36 +107,38 @@
 
     while (walker.nextNode()) {
       const textNode = walker.currentNode;
-      const dateMatch = textNode.textContent.match(CONFIG.DATE_PATTERN);
-      if (!dateMatch) continue;
-
-      let el = textNode.parentElement;
-      let hasNotebookLink = false;
-      while (el && el !== document.body) {
-        if (el.querySelector('a[href*="/notebook/"]')) {
-          hasNotebookLink = true;
-          break;
-        }
-        el = el.parentElement;
-      }
-      if (!hasNotebookLink) continue;
+      const parsed = parseDate(textNode.textContent);
+      if (!parsed) continue;
 
       const dateElement = textNode.parentElement;
-      if (seen.has(dateElement)) continue;
-      seen.add(dateElement);
+      if (!dateElement || seen.has(dateElement)) continue;
 
+      if (requireLink && !hasNotebookLinkAncestor(dateElement)) continue;
+      if (isToolkitElement(dateElement)) continue;
+
+      seen.add(dateElement);
       results.push({
         dateElement,
-        dateStr: dateMatch[0],
-        date: new Date(
-          parseInt(dateMatch[1], 10),
-          parseInt(dateMatch[2], 10) - 1,
-          parseInt(dateMatch[3], 10),
-        ),
+        dateStr: parsed.dateStr,
+        date: parsed.date,
       });
     }
 
     return results;
+  }
+
+  function hasNotebookLinkAncestor(el) {
+    let current = el;
+    while (current && current !== document.body) {
+      if (current.querySelector(CONFIG.NOTEBOOK_LINK_SELECTOR)) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  /** 自前で注入したUIを探索対象から除外する */
+  function isToolkitElement(el) {
+    return el.closest(`#${CONFIG.PANEL_ID}`) !== null;
   }
 
   /**
@@ -119,7 +189,6 @@
       }
     }
 
-    console.log(CONFIG.LOG, `コンテナ検出: ${bestCount}個の直接子要素`);
     return bestContainer;
   }
 
@@ -141,57 +210,87 @@
     return Array.from(unitMap.values());
   }
 
+  /** 探索結果をまとめて取得する */
+  function collect() {
+    const dateElements = discoverDateElements();
+    const container = findBestContainer(dateElements);
+    if (!container) return { dateElements, container: null, units: [] };
+    return {
+      dateElements,
+      container,
+      units: buildSortUnits(dateElements, container),
+    };
+  }
+
   // ============================================================
   // ツールバー要素の発見
   // ============================================================
 
-  function findSortButtonElement() {
-    for (const text of CONFIG.SORT_BUTTON_TEXTS) {
-      const result = document.evaluate(
-        `//*[contains(text(), '${text}')]`,
-        document.body,
-        null,
-        XPathResult.FIRST_ORDERED_NODE_TYPE,
-        null,
-      );
-      if (result.singleNodeValue) {
-        const found = result.singleNodeValue;
-        return (
-          found.closest("button") ||
-          found.closest('[role="button"]') ||
-          found.closest('[role="listbox"]') ||
-          found
-        );
+  /**
+   * 並び替えUIらしきボタンを探す。完全一致を優先し、無ければ部分一致。
+   */
+  function findAnchorElement() {
+    const candidates = document.querySelectorAll(
+      'button, [role="button"], [role="combobox"], [role="listbox"]',
+    );
+    let loose = null;
+
+    for (const el of candidates) {
+      if (isToolkitElement(el)) continue;
+      const text = (el.textContent || "").trim();
+      // ラベルとして不自然に長いものは容器要素なので除外
+      if (!text || text.length > 24) continue;
+
+      for (const label of CONFIG.SORT_LABELS) {
+        if (text === label) return el;
+        if (!loose && text.includes(label)) loose = el;
       }
     }
-    return null;
+    return loose;
   }
 
   // ============================================================
-  // ソート機能
+  // UI部品の生成
   // ============================================================
 
-  let isSorting = false;
+  const FLOATING_STYLE = {
+    padding: "6px 12px",
+    borderRadius: "8px",
+    color: "#e8eaed",
+    fontFamily: "system-ui, sans-serif",
+    fontSize: "13px",
+    fontWeight: "500",
+  };
 
-  function injectSortButton(anchorElement) {
-    if (document.getElementById(CONFIG.SORT_BUTTON_ID)) return;
+  /** アンカー要素の見た目を引き継ぐ（浮動時は既定値） */
+  function resolveStyle(anchorElement) {
+    if (!anchorElement) return FLOATING_STYLE;
+    const c = window.getComputedStyle(anchorElement);
+    return {
+      padding: c.padding || FLOATING_STYLE.padding,
+      borderRadius: c.borderRadius || FLOATING_STYLE.borderRadius,
+      color: c.color || "inherit",
+      fontFamily: c.fontFamily || "inherit",
+      fontSize: c.fontSize || FLOATING_STYLE.fontSize,
+      fontWeight: c.fontWeight || FLOATING_STYLE.fontWeight,
+    };
+  }
 
+  function createSortButton(style) {
     const btn = document.createElement("button");
     btn.id = CONFIG.SORT_BUTTON_ID;
     btn.dataset.order = "desc";
-
-    const computed = window.getComputedStyle(anchorElement);
     btn.style.cssText = `
-      padding: ${computed.padding || "6px 16px"};
-      border: 1px solid rgba(255,255,255,0.2);
-      border-radius: ${computed.borderRadius || "8px"};
+      padding: ${style.padding};
+      border: 1px solid rgba(138,180,248,0.5);
+      border-radius: ${style.borderRadius};
       background: transparent;
-      color: ${computed.color || "inherit"};
-      font-family: ${computed.fontFamily || "inherit"};
-      font-size: ${computed.fontSize || "14px"};
-      font-weight: ${computed.fontWeight || "normal"};
+      color: ${style.color};
+      font-family: ${style.fontFamily};
+      font-size: ${style.fontSize};
+      font-weight: ${style.fontWeight};
       cursor: pointer;
-      margin-left: 8px;
+      white-space: nowrap;
       position: relative;
       z-index: 1;
     `;
@@ -206,35 +305,112 @@
       updateSortButtonLabel(btn);
     });
 
-    anchorElement.insertAdjacentElement("afterend", btn);
-    console.log(CONFIG.LOG, "ソートボタンを注入しました");
+    return btn;
   }
 
+  function createSearchInput(style) {
+    const input = document.createElement("input");
+    input.id = CONFIG.SEARCH_INPUT_ID;
+    input.type = "text";
+    input.placeholder = "ノートブックを検索...";
+    input.style.cssText = `
+      padding: ${style.padding};
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: ${style.borderRadius};
+      background: transparent;
+      color: ${style.color};
+      font-family: ${style.fontFamily};
+      font-size: ${style.fontSize};
+      width: 200px;
+      outline: none;
+      position: relative;
+      z-index: 1;
+    `;
+
+    input.addEventListener("focus", () => {
+      input.style.borderColor = "rgba(138,180,248,0.8)";
+    });
+    input.addEventListener("blur", () => {
+      input.style.borderColor = "rgba(255,255,255,0.25)";
+    });
+
+    // イベントが裏のUIに伝播しないようにする
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("keydown", (e) => e.stopPropagation());
+
+    let filterTimer = null;
+    input.addEventListener("input", () => {
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => performFilter(input.value), 150);
+    });
+
+    return input;
+  }
+
+  // ============================================================
+  // UI注入（インライン / 浮動パネル）
+  // ============================================================
+
+  function isInjected() {
+    return document.getElementById(CONFIG.SORT_BUTTON_ID) !== null;
+  }
+
+  function injectInline(anchorElement) {
+    const style = resolveStyle(anchorElement);
+    const btn = createSortButton(style);
+    btn.style.marginLeft = "8px";
+    const input = createSearchInput(style);
+    input.style.marginLeft = "8px";
+
+    anchorElement.insertAdjacentElement("afterend", btn);
+    btn.insertAdjacentElement("afterend", input);
+    console.log(CONFIG.LOG, "ツールバーを注入しました（インライン）");
+  }
+
+  function injectFloating() {
+    const panel = document.createElement("div");
+    panel.id = CONFIG.PANEL_ID;
+    panel.style.cssText = `
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 2147483000;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(32,33,36,0.94);
+      box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+    `;
+
+    const style = FLOATING_STYLE;
+    panel.appendChild(createSortButton(style));
+    panel.appendChild(createSearchInput(style));
+    document.body.appendChild(panel);
+    console.log(CONFIG.LOG, "ツールバーを注入しました（浮動パネル）");
+  }
+
+  // ============================================================
+  // ソート機能
+  // ============================================================
+
+  let isSorting = false;
+
   function updateSortButtonLabel(btn) {
-    const dateElements = discoverDateElements();
-    const container = findBestContainer(dateElements);
-    let count = 0;
-    if (container) {
-      for (const item of dateElements) {
-        if (container.contains(item.dateElement)) count++;
-      }
-    }
-    const arrow = btn.dataset.order === "desc" ? "\u2193" : "\u2191";
-    const countStr = count > 0 ? ` (${count}件)` : "";
+    const { units } = collect();
+    const arrow = btn.dataset.order === "desc" ? "↓" : "↑";
+    const countStr = units.length > 0 ? ` (${units.length}件)` : "";
     btn.textContent = `作成日順 ${arrow}${countStr}`;
   }
 
   function performSort(order = "desc") {
-    const dateElements = discoverDateElements();
-    const container = findBestContainer(dateElements);
+    const { container, units } = collect();
 
-    if (!container) {
-      console.warn(CONFIG.LOG, "コンテナが見つかりません");
+    if (!container || units.length === 0) {
+      console.warn(CONFIG.LOG, "ソート対象のコンテナが見つかりません");
       return;
     }
-
-    const units = buildSortUnits(dateElements, container);
-    if (units.length === 0) return;
 
     units.sort((a, b) => {
       const diff = a.date.getTime() - b.date.getTime();
@@ -260,65 +436,11 @@
   /** 元の display 値を保存するための WeakMap */
   const originalDisplay = new WeakMap();
 
-  function injectSearchInput(anchorElement) {
-    if (document.getElementById(CONFIG.SEARCH_INPUT_ID)) return;
-
-    const input = document.createElement("input");
-    input.id = CONFIG.SEARCH_INPUT_ID;
-    input.type = "text";
-    input.placeholder = "ノートブックを検索...";
-
-    const computed = window.getComputedStyle(anchorElement);
-    input.style.cssText = `
-      padding: ${computed.padding || "6px 16px"};
-      border: 1px solid rgba(255,255,255,0.2);
-      border-radius: ${computed.borderRadius || "8px"};
-      background: transparent;
-      color: ${computed.color || "inherit"};
-      font-family: ${computed.fontFamily || "inherit"};
-      font-size: ${computed.fontSize || "14px"};
-      margin-left: 8px;
-      width: 200px;
-      outline: none;
-      position: relative;
-      z-index: 1;
-    `;
-
-    // フォーカス時のスタイル
-    input.addEventListener("focus", () => {
-      input.style.borderColor = "rgba(138,180,248,0.8)";
-    });
-    input.addEventListener("blur", () => {
-      input.style.borderColor = "rgba(255,255,255,0.2)";
-    });
-
-    // イベントが裏のUIに伝播しないようにする
-    input.addEventListener("click", (e) => e.stopPropagation());
-    input.addEventListener("keydown", (e) => e.stopPropagation());
-
-    // リアルタイムフィルタ
-    let filterTimer = null;
-    input.addEventListener("input", () => {
-      clearTimeout(filterTimer);
-      filterTimer = setTimeout(() => performFilter(input.value), 150);
-    });
-
-    // ソートボタンの後に挿入（あれば）、なければアンカーの後
-    const sortBtn = document.getElementById(CONFIG.SORT_BUTTON_ID);
-    const insertAfter = sortBtn || anchorElement;
-    insertAfter.insertAdjacentElement("afterend", input);
-
-    console.log(CONFIG.LOG, "検索フィールドを注入しました");
-  }
-
   function performFilter(query) {
-    const dateElements = discoverDateElements();
-    const container = findBestContainer(dateElements);
-    if (!container) return;
+    const { units } = collect();
+    if (units.length === 0) return;
 
-    const units = buildSortUnits(dateElements, container);
     const normalizedQuery = query.trim().toLowerCase();
-
     let visibleCount = 0;
 
     for (const unit of units) {
@@ -329,25 +451,50 @@
         originalDisplay.set(el, el.style.display);
       }
 
-      if (normalizedQuery === "") {
-        // フィルタ解除
+      const matched =
+        normalizedQuery === "" ||
+        el.textContent.toLowerCase().includes(normalizedQuery);
+
+      if (matched) {
         el.style.display = originalDisplay.get(el) || "";
         visibleCount++;
       } else {
-        // カード内のテキストで部分一致検索
-        const cardText = el.textContent.toLowerCase();
-        if (cardText.includes(normalizedQuery)) {
-          el.style.display = originalDisplay.get(el) || "";
-          visibleCount++;
-        } else {
-          el.style.display = "none";
-        }
+        el.style.display = "none";
       }
     }
 
     console.log(
       CONFIG.LOG,
       `フィルタ "${query}": ${visibleCount}/${units.length}件表示`,
+    );
+  }
+
+  // ============================================================
+  // 診断ログ（UIを出せなかったときに原因を吐く）
+  // ============================================================
+
+  let failureCount = 0;
+  let diagnosed = false;
+
+  function logDiagnostics(dateElements) {
+    const links = document.querySelectorAll(CONFIG.NOTEBOOK_LINK_SELECTOR);
+    const buttonTexts = [];
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const t = (el.textContent || "").trim();
+      if (t && t.length <= 24 && !buttonTexts.includes(t)) buttonTexts.push(t);
+      if (buttonTexts.length >= 20) break;
+    }
+
+    console.warn(
+      CONFIG.LOG,
+      "UIを注入できませんでした。以下を開発者に共有してください:",
+      {
+        url: location.href,
+        日付要素の数: dateElements.length,
+        日付サンプル: dateElements.slice(0, 3).map((d) => d.dateStr),
+        ノートブックリンク数: links.length,
+        ボタンラベル一覧: buttonTexts,
+      },
     );
   }
 
@@ -359,36 +506,93 @@
 
   function tryInjectUI() {
     const dateElements = discoverDateElements();
+
+    if (isInjected()) {
+      // 一覧が遅延ロードされるので件数表示だけ追従させる
+      updateSortButtonLabel(document.getElementById(CONFIG.SORT_BUTTON_ID));
+      return;
+    }
+
     if (dateElements.length === 0) return;
 
-    const sortBtn = findSortButtonElement();
-    if (!sortBtn) return;
+    const anchor = findAnchorElement();
+    if (anchor) {
+      injectInline(anchor);
+      failureCount = 0;
+      diagnosed = false;
+      return;
+    }
 
-    // ソートボタン注入
-    injectSortButton(sortBtn);
-    // 検索フィールド注入
-    injectSearchInput(sortBtn);
+    // 並び替えUIが見つからない場合は一定回数待ってから浮動パネルに切り替える
+    failureCount++;
+    if (failureCount >= CONFIG.ANCHOR_RETRY_LIMIT) {
+      injectFloating();
+      failureCount = 0;
+      diagnosed = false;
+    } else if (!diagnosed && failureCount === 3) {
+      diagnosed = true;
+      logDiagnostics(dateElements);
+    }
+  }
+
+  /**
+   * 注入できるまで定期的にリトライする。
+   * 一覧の描画が終わってDOMの変化が止まると MutationObserver は発火しないため、
+   * フォールバック（浮動パネル）への到達をタイマーで保証する。
+   */
+  let retryTimer = null;
+  let retryCount = 0;
+
+  function startRetryLoop() {
+    stopRetryLoop();
+    retryCount = 0;
+    retryTimer = setInterval(() => {
+      if (isInjected() || ++retryCount > CONFIG.RETRY_MAX) {
+        stopRetryLoop();
+        return;
+      }
+      tryInjectUI();
+    }, CONFIG.RETRY_INTERVAL_MS);
+  }
+
+  function stopRetryLoop() {
+    if (retryTimer) clearInterval(retryTimer);
+    retryTimer = null;
+  }
+
+  function resetInjection() {
+    document.getElementById(CONFIG.PANEL_ID)?.remove();
+    document.getElementById(CONFIG.SORT_BUTTON_ID)?.remove();
+    document.getElementById(CONFIG.SEARCH_INPUT_ID)?.remove();
+    failureCount = 0;
+    diagnosed = false;
   }
 
   function initialize() {
     const observer = new MutationObserver(() => {
       if (isSorting) return;
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => tryInjectUI(), CONFIG.DEBOUNCE_MS);
+      debounceTimer = setTimeout(tryInjectUI, CONFIG.DEBOUNCE_MS);
     });
     observer.observe(document.body, { childList: true, subtree: true });
+
     tryInjectUI();
+    startRetryLoop();
 
     // SPA遷移検知
     let lastUrl = location.href;
     new MutationObserver(() => {
       if (location.href !== lastUrl) {
         lastUrl = location.href;
-        setTimeout(tryInjectUI, 1000);
+        resetInjection();
+        setTimeout(() => {
+          tryInjectUI();
+          startRetryLoop();
+        }, 1000);
       }
     }).observe(document, { subtree: true, childList: true });
 
-    console.log(CONFIG.LOG, "初期化完了");
+    console.log(CONFIG.LOG, "初期化完了", location.host);
   }
 
   initialize();
