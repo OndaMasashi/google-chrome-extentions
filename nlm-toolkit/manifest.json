@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Notebook Toolkit",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Gemini Notebook（旧NotebookLM）のノートブック一覧に作成日順ソート・タイトル検索機能を追加します",
   "content_scripts": [
     {
