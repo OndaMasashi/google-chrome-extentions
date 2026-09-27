@@ -295,14 +295,17 @@
       z-index: 1;
     `;
 
-    updateSortButtonLabel(btn);
+    setSortButtonLabel(btn, 0);
 
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      btn.dataset.order = btn.dataset.order === "desc" ? "asc" : "desc";
-      performSort(btn.dataset.order);
-      updateSortButtonLabel(btn);
+      // 初回はラベルの矢印どおりの順を適用し、2回目以降でトグルする。
+      // 旧実装は初回クリックでいきなり反転していたため、↓表示なのに昇順になっていた。
+      if (sortState) {
+        btn.dataset.order = btn.dataset.order === "desc" ? "asc" : "desc";
+      }
+      setSortButtonLabel(btn, performSort(btn.dataset.order));
     });
 
     return btn;
@@ -365,6 +368,7 @@
     anchorElement.insertAdjacentElement("afterend", btn);
     btn.insertAdjacentElement("afterend", input);
     console.log(CONFIG.LOG, "ツールバーを注入しました（インライン）");
+    refresh();
   }
 
   function injectFloating() {
@@ -389,44 +393,90 @@
     panel.appendChild(createSearchInput(style));
     document.body.appendChild(panel);
     console.log(CONFIG.LOG, "ツールバーを注入しました（浮動パネル）");
+    refresh();
   }
 
   // ============================================================
   // ソート機能
   // ============================================================
 
-  let isSorting = false;
+  /** 適用中の並び順。null なら未ソート */
+  let sortState = null;
 
-  function updateSortButtonLabel(btn) {
-    const { units } = collect();
+  function setSortButtonLabel(btn, count) {
     const arrow = btn.dataset.order === "desc" ? "↓" : "↑";
-    const countStr = units.length > 0 ? ` (${units.length}件)` : "";
+    const countStr = count > 0 ? ` (${count}件)` : "";
     btn.textContent = `作成日順 ${arrow}${countStr}`;
   }
 
-  function performSort(order = "desc") {
+  /**
+   * 指定順に並べ替える。既にその順なら DOM を一切触らない（冪等）。
+   * 冪等なので MutationObserver から再適用を呼んでも無限ループしない。
+   * @returns {boolean} DOM を変更したか
+   */
+  function applySortTo(container, units, order) {
+    const desired = units
+      .slice()
+      .sort((a, b) => {
+        const diff = a.date.getTime() - b.date.getTime();
+        return order === "desc" ? -diff : diff;
+      })
+      .map((u) => u.sortableElement);
+
+    const desiredSet = new Set(desired);
+    const current = Array.from(container.children).filter((el) =>
+      desiredSet.has(el),
+    );
+
+    if (
+      current.length === desired.length &&
+      current.every((el, i) => el === desired[i])
+    ) {
+      return false;
+    }
+
+    for (const el of desired) container.appendChild(el);
+    return true;
+  }
+
+  /**
+   * ボタンクリックからの実行。以降は一覧が再描画されても並び順を維持する。
+   * @returns {number} 並べ替え対象の件数（失敗時は 0）
+   */
+  function performSort(order) {
     const { container, units } = collect();
 
     if (!container || units.length === 0) {
-      console.warn(CONFIG.LOG, "ソート対象のコンテナが見つかりません");
-      return;
+      console.warn(
+        CONFIG.LOG,
+        "ソートできません: 並べ替え対象のカードを検出できませんでした",
+      );
+      return 0;
     }
 
-    units.sort((a, b) => {
-      const diff = a.date.getTime() - b.date.getTime();
-      return order === "desc" ? -diff : diff;
-    });
-
-    isSorting = true;
-    for (const unit of units) {
-      container.appendChild(unit.sortableElement);
-    }
-    isSorting = false;
+    const changed = applySortTo(container, units, order);
+    sortState = { order };
 
     console.log(
       CONFIG.LOG,
-      `${units.length}件を作成日${order === "desc" ? "降順" : "昇順"}でソートしました`,
+      `ソート実行: 作成日${order === "desc" ? "降順" : "昇順"} / 対象${units.length}件 / DOM変更${changed ? "あり" : "なし（既にこの順）"}`,
+      container,
     );
+    return units.length;
+  }
+
+  /** 一覧の更新に追従する（件数表示の更新 + 並び順の再適用） */
+  function refresh() {
+    const btn = document.getElementById(CONFIG.SORT_BUTTON_ID);
+    if (!btn) return;
+
+    const { container, units } = collect();
+    setSortButtonLabel(btn, units.length);
+
+    if (!sortState || !container || units.length === 0) return;
+    if (applySortTo(container, units, sortState.order)) {
+      console.log(CONFIG.LOG, `並び順を再適用しました (${units.length}件)`);
+    }
   }
 
   // ============================================================
@@ -505,14 +555,12 @@
   let debounceTimer = null;
 
   function tryInjectUI() {
-    const dateElements = discoverDateElements();
-
     if (isInjected()) {
-      // 一覧が遅延ロードされるので件数表示だけ追従させる
-      updateSortButtonLabel(document.getElementById(CONFIG.SORT_BUTTON_ID));
+      refresh();
       return;
     }
 
+    const dateElements = discoverDateElements();
     if (dateElements.length === 0) return;
 
     const anchor = findAnchorElement();
@@ -564,13 +612,16 @@
     document.getElementById(CONFIG.PANEL_ID)?.remove();
     document.getElementById(CONFIG.SORT_BUTTON_ID)?.remove();
     document.getElementById(CONFIG.SEARCH_INPUT_ID)?.remove();
+    sortState = null;
     failureCount = 0;
     diagnosed = false;
   }
 
   function initialize() {
+    // applySortTo が冪等なので、自分の並べ替えで再発火しても1周で収束する。
+    // （旧実装の isSorting フラグは MutationObserver が非同期に呼ばれる都合で
+    //   コールバック時点では必ず false に戻っており、ガードとして機能していなかった）
     const observer = new MutationObserver(() => {
-      if (isSorting) return;
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(tryInjectUI, CONFIG.DEBOUNCE_MS);
     });
